@@ -28,5 +28,6 @@
     "**/__pycache__": true,
     "**/.pytest_cache": true,
     "**/.dspy_cache": true
-  }
+  },
+  "python.terminal.useEnvFile": true
 }
