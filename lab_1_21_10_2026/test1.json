@@ -1,0 +1,20 @@
+{
+  "repo": "hono",
+  "number": 3908,
+  "title": "`Content-Type` header only works with `ctx.body()`",
+  "body": "### What version of Hono are you using?\n\n4.7.0\n\n### What runtime/platform is your app running on? (with version if possible)\n\nCloudflare Workers\n\n### What steps can reproduce the bug?\n\nThe following code DOESN'T work\n\n```js\nctx.text(await res.text(), {\n        headers: {\n            'Content-Type': 'text/javascript',\n        },\n});\n```\n\nThe following code DOES work\n\n```js\nctx.body(await res.text(), {\n        headers: {\n            'Content-Type': 'text/javascript',\n        },\n});\n```\n\nYou should make `text` function (but probably also `json` and others) to omit `Content-Type` header from his typescript type...\n\n### What is the expected behavior?\n\nif it doesn't work typescript should complain (also javascript because you shouldn't be able to do a thing like this at all)\n\n### What do you see instead?\n\nno error but wrong `Content-Type` (`text/plain` in my case)\n\n### Additional information\n\n_No response_",
+  "state": "open",
+  "labels": [
+    "enhancement"
+  ],
+  "created_at": "2025-02-09T09:37:18Z",
+  "closed_at": null,
+  "comments": 10,
+  "author_association": "NONE",
+  "url": "https://github.com/honojs/hono/issues/3908",
+  "gold_type": "enhancement",
+  "gold_component": null,
+  "gold_has_reproduction_steps": null,
+  "gold_severity": null,
+  "gold_duplicate_candidate": null
+}
