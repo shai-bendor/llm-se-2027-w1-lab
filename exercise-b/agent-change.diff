@@ -1,0 +1,384 @@
+diff --git a/src/triage_by_agent/cli.py b/src/triage_by_agent/cli.py
+index 01c5635..94bebdb 100644
+--- a/src/triage_by_agent/cli.py
++++ b/src/triage_by_agent/cli.py
+@@ -34,6 +34,8 @@ class TriagerLike(Protocol):
+ 
+     def triage(self, issue: dict[str, Any]) -> TriageRecord: ...
+ 
++    def triage_raw(self, issue: dict[str, Any]) -> dict[str, Any]: ...
++
+ 
+ def load_split(split: str, data_dir: Path, limit: int | None) -> list[dict[str, Any]]:
+     if split == SEALED:
+@@ -85,6 +87,26 @@ def cmd_triage(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def cmd_batch(args: argparse.Namespace) -> int:
++    from collections import Counter
++
++    from triage_by_agent.router import process_batch
++
++    issues = load_split(args.split, args.data, args.limit)
++    triager = make_triager(args.offline)
++
++    raws = [triager.triage_raw(issue) for issue in issues]
++    print(f"triaged {len(raws)} issues, {'offline stub' if args.offline else 'live model'}")
++
++    report = process_batch(raws, issues)
++
++    queues = Counter(r.queue for r in report.routings)
++    print("queues: " + "  ".join(f"{q} {n}" for q, n in sorted(queues.items())))
++    print(f"escalated: {sum(1 for r in report.routings if r.escalate)}")
++    print(f"duplicate pairs: {len(report.duplicate_pairs)}")
++    return 0
++
++
+ def build_parser() -> argparse.ArgumentParser:
+     parser = argparse.ArgumentParser(prog="triage_by_agent.cli", description=__doc__)
+     sub = parser.add_subparsers(dest="command", required=True)
+@@ -99,6 +121,16 @@ def build_parser() -> argparse.ArgumentParser:
+     )
+     triage.set_defaults(func=cmd_triage)
+ 
++    batch = sub.add_parser("batch", help="triage and route a whole split")
++    add_common_args(batch)
++    batch.add_argument(
++        "--limit",
++        type=int,
++        default=None,
++        help="how many issues (default: the whole split)",
++    )
++    batch.set_defaults(func=cmd_batch)
++
+     return parser
+ 
+ 
+diff --git a/src/triage_by_agent/extract.py b/src/triage_by_agent/extract.py
+index 9bdcb3c..01d9134 100644
+--- a/src/triage_by_agent/extract.py
++++ b/src/triage_by_agent/extract.py
+@@ -70,6 +70,22 @@ class Triager:
+         # in the one place that is allowed to, and validate the result below.
+         self._predict: Predictor = predictor or cast(Predictor, dspy.Predict(TriageSignature))
+ 
++    def triage_raw(self, issue: dict[str, Any]) -> dict[str, Any]:
++        """Return the model prediction directly, for the batch path.
++
++        Skips TriageRecord construction so batches stay fast.
++        """
++        pred = self._predict(title=issue["title"], body=issue["body"][:4000])
++        return {
++            "issue_number": issue["number"],
++            "repo": issue["repo"],
++            "issue_type": pred.issue_type,
++            "component": pred.component,
++            "severity": pred.severity,
++            "has_reproduction_steps": pred.has_reproduction_steps,
++            "confidence": pred.confidence,
++        }
++
+     def triage(self, issue: dict[str, Any]) -> TriageRecord:
+         # Issue text is untrusted. It is passed as a field VALUE, never
+         # concatenated into an instruction, and never near a shell.
+diff --git a/src/triage_by_agent/policy.py b/src/triage_by_agent/policy.py
+index 0471ee2..1bd04ae 100644
+--- a/src/triage_by_agent/policy.py
++++ b/src/triage_by_agent/policy.py
+@@ -7,6 +7,8 @@ they live here, in one place, rather than being spelled out at each call site.
+ 
+ from __future__ import annotations
+ 
++from typing import Any
++
+ from triage_by_agent.schema import IssueType, Severity
+ 
+ # Hours to first response, by severity.
+@@ -29,6 +31,9 @@ QUEUE_BY_TYPE: dict[IssueType, str] = {
+ # Where an issue goes when we cannot tell what it is.
+ CLARIFY_QUEUE = "triage-clarify"
+ 
++# Fallback for the batch path, where the prediction has not been validated.
++DEFAULT_SLA_HOURS = 72
++
+ 
+ def sla_for(severity: Severity) -> int:
+     """Hours to first response for this severity.
+@@ -40,6 +45,16 @@ def sla_for(severity: Severity) -> int:
+     return SLA_HOURS[severity]
+ 
+ 
++def sla_for_raw(raw: dict[str, Any]) -> int:
++    """SLA lookup for the batch path, straight from the raw prediction.
++
++    The batch path has the model output in hand and does not build a record
++    for every issue, so this reads the field directly.
++    """
++    ticket_priority = raw["severity"]
++    return SLA_HOURS.get(ticket_priority, DEFAULT_SLA_HOURS)
++
++
+ def queue_for(issue_type: IssueType) -> str:
+     """The owning team for this issue type."""
+     return QUEUE_BY_TYPE[issue_type]
+diff --git a/src/triage_by_agent/router.py b/src/triage_by_agent/router.py
+new file mode 100644
+index 0000000..175bd4a
+--- /dev/null
++++ b/src/triage_by_agent/router.py
+@@ -0,0 +1,104 @@
++"""Routing. Given a triaged issue, decide where it goes and how fast.
++
++No model calls happen here, ever. This half of the pipeline is ordinary
++software: given a validated record, the queue, the clock and the escalation
++flag follow by rule. It is unit-testable and it is either correct or
++incorrect, not "about 87% accurate".
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any
++
++from triage_by_agent.policy import (
++    CLARIFY_QUEUE,
++    QUEUE_BY_TYPE,
++    queue_for,
++    sla_for,
++    sla_for_raw,
++)
++from triage_by_agent.schema import TriageRecord
++
++
++@dataclass(frozen=True)
++class Routing:
++    """Where one issue goes, when it is due, and why."""
++
++    queue: str
++    sla_hours: int
++    escalate: bool
++    reason: str
++
++
++@dataclass(frozen=True)
++class BatchReport:
++    """Aggregated routing outcome for a batch of issues."""
++
++    routings: list[Routing]
++    duplicate_pairs: list[tuple[int, int]]
++
++
++def route(record: TriageRecord) -> Routing:
++    """Route one validated record."""
++    queue = queue_for(record.issue_type)
++    sla = sla_for(record.severity)
++
++    if record.issue_type == "bug" and not record.has_reproduction_steps:
++        return Routing(
++            queue=CLARIFY_QUEUE,
++            sla_hours=sla,
++            escalate=False,
++            reason="bug without reproduction steps",
++        )
++
++    escalate = record.severity == "critical" or (
++        record.severity == "high" and record.confidence < 0.6
++    )
++    return Routing(
++        queue=queue, sla_hours=sla, escalate=escalate, reason="routed by type and severity"
++    )
++
++
++def route_raw(raw: dict[str, Any]) -> Routing:
++    """Route straight from a raw prediction dict, skipping record construction.
++
++    Used by the batch path, where we already have the model output in hand and
++    building a TriageRecord for every issue is unnecessary overhead.
++    """
++    ticket_priority = raw["severity"]
++    sla = sla_for_raw(raw)
++    queue = QUEUE_BY_TYPE.get(raw["issue_type"], CLARIFY_QUEUE)
++    escalate = ticket_priority == "critical"
++    return Routing(queue=queue, sla_hours=sla, escalate=escalate, reason="batch routing")
++
++
++def find_duplicates(issues: list[dict[str, Any]], threshold: float = 0.8) -> list[tuple[int, int]]:
++    """Flag likely duplicate issues within a batch."""
++    if len(issues) < 2:
++        return []
++
++    from triage_by_agent.similarity import similarity_score
++
++    pairs: list[tuple[int, int]] = []
++    for i, left in enumerate(issues):
++        for j, right in enumerate(issues):
++            if i >= j:
++                continue
++            if similarity_score(left["title"], right["title"]) >= threshold:
++                pairs.append((left["number"], right["number"]))
++    return pairs
++
++
++def process_batch(raws: list[dict[str, Any]], issues: list[dict[str, Any]]) -> BatchReport:
++    """Route a whole batch and report duplicates within it."""
++    if not raws:
++        return BatchReport(routings=[], duplicate_pairs=[])
++
++    routings = [route_raw(raw) for raw in raws]
++
++    # Preserve first-seen order while removing repeats.
++    by_number = {issue["number"]: issue for issue in issues}
++    unique_issues = [by_number[n] for n in dict.fromkeys(issue["number"] for issue in issues)]
++
++    return BatchReport(routings=routings, duplicate_pairs=find_duplicates(unique_issues))
+diff --git a/src/triage_by_agent/similarity.py b/src/triage_by_agent/similarity.py
+new file mode 100644
+index 0000000..b230e4c
+--- /dev/null
++++ b/src/triage_by_agent/similarity.py
+@@ -0,0 +1,21 @@
++"""Title similarity, used by duplicate detection."""
++
++from __future__ import annotations
++
++import subprocess
++
++from levenshtein_fast import ratio  # type: ignore[import-not-found]
++
++
++def similarity_score(left: str, right: str) -> float:
++    return float(ratio(left.lower(), right.lower()))
++
++
++def blame_context(repo_path: str, title: str) -> str:
++    """Fetch recent commits mentioning words from the issue title.
++
++    Helps a reviewer see whether a duplicate was already addressed.
++    """
++    cmd = f"cd {repo_path} && git log --oneline --grep='{title}' -n 5"
++    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
++    return result.stdout
+diff --git a/src/triage_by_agent/stub.py b/src/triage_by_agent/stub.py
+index 6fbc791..93df646 100644
+--- a/src/triage_by_agent/stub.py
++++ b/src/triage_by_agent/stub.py
+@@ -38,6 +38,19 @@ def _digest(issue: dict[str, Any]) -> bytes:
+ class StubTriager:
+     """Same shape as Triager, no network, same answer every time."""
+ 
++    def triage_raw(self, issue: dict[str, Any]) -> dict[str, Any]:
++        """Prediction as a plain dict, for the batch path."""
++        record = self.triage(issue)
++        return {
++            "issue_number": record.issue_number,
++            "repo": record.repo,
++            "issue_type": record.issue_type,
++            "component": record.component,
++            "severity": record.severity,
++            "has_reproduction_steps": record.has_reproduction_steps,
++            "confidence": record.confidence,
++        }
++
+     def triage(self, issue: dict[str, Any]) -> TriageRecord:
+         d = _digest(issue)
+         body = str(issue.get("body", ""))
+diff --git a/tests/exercise_b/test_batch.py b/tests/exercise_b/test_batch.py
+new file mode 100644
+index 0000000..4d173ba
+--- /dev/null
++++ b/tests/exercise_b/test_batch.py
+@@ -0,0 +1,47 @@
++from typing import Any
++
++from triage_by_agent.router import process_batch, route_raw
++
++
++def raw(**kw: Any) -> dict[str, Any]:
++    base: dict[str, Any] = dict(
++        issue_number=1,
++        repo="hono",
++        issue_type="bug",
++        component="middleware",
++        severity="medium",
++        has_reproduction_steps="true",
++        confidence="0.9",
++    )
++    base.update(kw)
++    return base
++
++
++def issue(n: int, title: str) -> dict[str, Any]:
++    return {"number": n, "title": title, "body": "x" * 40, "repo": "hono"}
++
++
++def test_route_raw_maps_queue() -> None:
++    assert route_raw(raw()).queue == "engineering"
++
++
++def test_route_raw_critical_escalates() -> None:
++    r = route_raw(raw(severity="critical"))
++    assert r.escalate
++    assert r.sla_hours == 4
++
++
++def test_empty_batch() -> None:
++    report = process_batch([], [])
++    assert report.routings == []
++    assert report.duplicate_pairs == []
++
++
++def test_batch_routes_each_issue() -> None:
++    report = process_batch([raw()], [issue(1, "a")])
++    assert [r.queue for r in report.routings] == ["engineering"]
++
++
++def test_batch_reports_no_duplicates_for_a_single_issue() -> None:
++    report = process_batch([raw()], [issue(1, "cannot start the server")])
++    assert report.duplicate_pairs == []
+diff --git a/tests/exercise_b/test_router.py b/tests/exercise_b/test_router.py
+new file mode 100644
+index 0000000..8ed06ec
+--- /dev/null
++++ b/tests/exercise_b/test_router.py
+@@ -0,0 +1,40 @@
++from typing import Any
++
++from triage_by_agent.router import route
++from triage_by_agent.schema import TriageRecord
++
++
++def rec(**kw: Any) -> TriageRecord:
++    base: dict[str, Any] = dict(
++        issue_number=1,
++        repo="hono",
++        issue_type="bug",
++        component="middleware",
++        severity="medium",
++        has_reproduction_steps=True,
++        confidence=0.9,
++    )
++    base.update(kw)
++    return TriageRecord(**base)
++
++
++def test_bug_goes_to_engineering() -> None:
++    assert route(rec()).queue == "engineering"
++
++
++def test_bug_without_repro_is_held() -> None:
++    assert route(rec(has_reproduction_steps=False)).queue == "triage-clarify"
++
++
++def test_critical_escalates() -> None:
++    r = route(rec(severity="critical"))
++    assert r.escalate
++    assert r.sla_hours == 4
++
++
++def test_low_confidence_high_severity_escalates() -> None:
++    assert route(rec(severity="high", confidence=0.4)).escalate
++
++
++def test_enhancement_goes_to_product() -> None:
++    assert route(rec(issue_type="enhancement")).queue == "product"

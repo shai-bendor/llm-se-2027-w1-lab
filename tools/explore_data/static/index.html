@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>explore_data — snapshot browser</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header>
+  <div class="brand">explore_data <span id="subtitle">data/snapshot</span></div>
+
+  <div class="split-pick">
+    <label for="split" class="hint" style="margin:0">split</label>
+    <select id="split"></select>
+    <span id="sealed-tag" class="sealed-tag" hidden>SEALED</span>
+  </div>
+
+  <div class="tabs" role="tablist">
+    <button id="tab-browse" role="tab" aria-selected="true">Browse</button>
+    <button id="tab-stats" role="tab" aria-selected="false">Statistics</button>
+  </div>
+
+  <div class="spacer"></div>
+  <span id="count" class="hint" style="margin:0"></span>
+  <button class="ghost" id="theme" title="Toggle light / dark">◐</button>
+</header>
+
+<div id="seal-banner" class="banner" hidden>
+  <b>test.json is the sealed split.</b>
+  <span>The manifest keeps it unseen so it can still measure something later. Opening it here is reading it.</span>
+  <button id="seal-ok">Open anyway</button>
+</div>
+
+<main>
+  <aside>
+    <div class="filter-head">
+      <h2>Filters</h2>
+      <button id="reset">reset</button>
+    </div>
+
+    <input type="search" id="q" placeholder="Search title and body…" autocomplete="off">
+    <div class="hint" id="q-hint">Matches raw text, case-insensitive.</div>
+
+    <fieldset><legend>Project</legend><div id="f-repo"></div></fieldset>
+    <fieldset><legend>Status</legend><div id="f-state"></div></fieldset>
+    <fieldset><legend>Gold type</legend><div id="f-type"></div></fieldset>
+    <fieldset>
+      <legend>Annotation effort</legend>
+      <div id="f-effort"></div>
+      <div class="hint">Derived, not in the data — see “how this is computed” in Statistics.</div>
+    </fieldset>
+    <fieldset><legend>Author association</legend><div id="f-author"></div></fieldset>
+    <fieldset>
+      <legend>Created</legend>
+      <div class="row"><input type="date" id="from"><input type="date" id="to"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Issue number</legend>
+      <div class="row"><input type="number" id="number_min" placeholder="min"><input type="number" id="number_max" placeholder="max"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Body size (chars)</legend>
+      <div class="row"><input type="number" id="min_chars" placeholder="min"><input type="number" id="max_chars" placeholder="max"></div>
+    </fieldset>
+    <fieldset>
+      <legend>GitHub label</legend>
+      <select id="label"><option value="">any</option></select>
+    </fieldset>
+  </aside>
+
+  <section class="view" id="view-browse">
+    <div class="list-col">
+      <div class="list-bar">
+        <span id="list-count">—</span>
+        <div class="spacer"></div>
+        <label for="sort" class="hint" style="margin:0">sort</label>
+        <select id="sort">
+          <option value="created_desc">newest</option>
+          <option value="created_asc">oldest</option>
+          <option value="number_desc">number ↓</option>
+          <option value="number_asc">number ↑</option>
+          <option value="longest">longest body</option>
+          <option value="shortest">shortest body</option>
+          <option value="effort">hardest to annotate</option>
+          <option value="comments">most discussed</option>
+        </select>
+      </div>
+      <div class="list" id="list"></div>
+    </div>
+
+    <div class="reader" id="reader">
+      <div class="empty">Select an issue.</div>
+    </div>
+  </section>
+
+  <section class="view stats" id="view-stats" hidden>
+    <div class="stats-inner" id="stats"></div>
+  </section>
+</main>
+
+<div id="tip"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
