@@ -27,19 +27,27 @@ PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ALLOW_SUBSTRINGS = ("xxxx", "XXXX")
 
 
-def staged_files() -> list[str]:
+def git(*args: str) -> str:
+    # Decode explicitly: with bare text=True, Windows uses the locale codepage
+    # (cp1252) and crashes on UTF-8 or binary content. errors="replace" keeps
+    # binary files scannable, since every key pattern above is plain ASCII.
     out = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"],
+        ["git", *args],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
-    return [f for f in out.stdout.splitlines() if f.strip()]
+    return out.stdout
+
+
+def staged_files() -> list[str]:
+    output = git("diff", "--cached", "--name-only", "--diff-filter=ACM")
+    return [f for f in output.splitlines() if f.strip()]
 
 
 def staged_content(path: str) -> str:
-    out = subprocess.run(["git", "show", f":{path}"], capture_output=True, text=True, check=False)
-    return out.stdout
+    return git("show", f":{path}")
 
 
 def main() -> int:
